@@ -2,6 +2,10 @@
 
 LunaNotiz ist eine lokale Notizverwaltung für Linux mit SQLite und PySide6.
 
+![LunaNotiz](lunanotiz.png)
+
+[Github Seite](https://github.com/Angonikro/LunaNotiz/)
+
 ## Funktionen
 - Notizen erstellen, bearbeiten, durchsuchen und löschen
 - Deutsche und englische Oberfläche
