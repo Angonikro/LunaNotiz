@@ -3,20 +3,27 @@
 from __future__ import annotations
 
 import os
+import json
+import base64
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QMenu, QSplitter, QTextEdit, QVBoxLayout, QWidget,
+    QMenu, QSplitter, QTextEdit, QVBoxLayout, QWidget, QFileDialog, QInputDialog,
+    QFormLayout,
 )
 
 APP_NAME = "LunaNotiz"
-VERSION = "0.1.9"
+VERSION = "0.2.6"
 UI_LANGUAGE = "de"
 
 TRANSLATIONS = {
@@ -57,6 +64,31 @@ TRANSLATIONS = {
     "Alle Notizen": "All notes",
     "Keine Treffer": "No matches",
     "Notiz": "Note", "Neue": "New",
+    "Datei": "File", "Exportieren …": "Export …", "Importieren …": "Import …",
+    "Sicherheit": "Security", "PIN-Schutz aktivieren / PIN ändern …": "Enable PIN protection / change PIN …",
+    "Ja": "Yes", "Nein": "No", "OK": "OK",
+    "PIN-Schutz deaktivieren": "Disable PIN protection", "PIN-Schutz ist bereits aktiviert.": "PIN protection is already enabled.", "Neue PIN": "New PIN",
+    "PIN (4–8 Ziffern)": "PIN (4–8 digits)", "PIN wiederholen": "Repeat PIN",
+    "Möchtest du LunaNotiz mit einer PIN schützen?": "Would you like to protect LunaNotiz with a PIN?",
+    "Die PIN muss aus 4 bis 8 Ziffern bestehen.": "The PIN must contain 4 to 8 digits.",
+    "Die PINs stimmen nicht überein.": "The PINs do not match.", "PIN gespeichert.": "PIN saved.",
+    "Bei Verlust der PIN ist kein Zugriff mehr möglich.": "If the PIN is lost, access cannot be recovered.",
+    "Falsche PIN.": "Incorrect PIN.", "PIN-Schutz wirklich deaktivieren?": "Really disable PIN protection?",
+    "Exportformat": "Export format", "Normales JSON": "Regular JSON",
+    "Verschlüsselte Sicherung (AES-256-GCM)": "Encrypted backup (AES-256-GCM)",
+    "Notizen exportieren": "Export notes", "Backup-Passwort": "Backup password",
+    "Bitte Backup-Passwort eingeben:": "Please enter backup password:",
+    "Exportformat auswählen:": "Select export format:",
+    "Importmodus auswählen:": "Select import mode:",
+    "Passwort wiederholen": "Repeat password", "Die Passwörter stimmen nicht überein.": "The passwords do not match.",
+    "Export abgeschlossen.": "Export completed.", "Notizen importieren": "Import notes",
+    "Importmodus": "Import mode", "Zusammenführen": "Merge",
+    "Alle vorhandenen Notizen ersetzen": "Replace all existing notes",
+    "Wirklich alle vorhandenen Notizen ersetzen?": "Really replace all existing notes?",
+    "Sicherung ungültig, beschädigt oder Passwort falsch.": "Backup invalid, damaged, or password incorrect.",
+    "Import abgeschlossen.": "Import completed.",
+    "Öffnen": "Open", "Dateiname:": "File name:", "Dateityp:": "File type:",
+    "Speichern": "Save", "Abbrechen": "Cancel", "PIN-Schutz deaktiviert. Du kannst ihn jederzeit über Sicherheit wieder aktivieren.": "PIN protection disabled. You can enable it again at any time under Security.",
 }
 
 
@@ -121,6 +153,193 @@ class NotesStore:
         self.db.close()
 
 
+def derive_key(password: str, salt: bytes) -> bytes:
+    return Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(password.encode("utf-8"))
+
+
+def ask_yes_no(parent, title: str, message: str, default_yes: bool = False) -> bool:
+    """Ja/Nein-Dialog mit explizit lokalisierten Schaltflächen."""
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Question)
+    box.setWindowTitle(title)
+    box.setText(message)
+    yes_button = box.addButton(tr("Ja"), QMessageBox.YesRole)
+    no_button = box.addButton(tr("Nein"), QMessageBox.NoRole)
+    box.setDefaultButton(yes_button if default_yes else no_button)
+    box.exec()
+    return box.clickedButton() is yes_button
+
+
+def localized_file_dialog(parent, title: str, save: bool, name_filter: str, initial_path: str = "") -> str | None:
+    """Nicht-nativen Dateidialog verwenden und Aktionsschaltflächen selbst übersetzen."""
+    dialog = QFileDialog(parent, title, initial_path, name_filter)
+    dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+    if save:
+        dialog.setAcceptMode(QFileDialog.AcceptSave)
+        dialog.setFileMode(QFileDialog.AnyFile)
+    else:
+        dialog.setAcceptMode(QFileDialog.AcceptOpen)
+        dialog.setFileMode(QFileDialog.ExistingFile)
+    # Qt-Plattformstile können die Aktionsschaltfläche trotz eigenem Dialog
+    # weiterhin mit dem englischen Standardtext beschriften. Deshalb sowohl
+    # Standardbutton/Role als auch die tatsächlich sichtbaren Buttons setzen.
+    accept_text = tr("Speichern") if save else tr("Öffnen")
+    dialog.setLabelText(QFileDialog.Accept, accept_text)
+    dialog.setLabelText(QFileDialog.Reject, tr("Abbrechen"))
+    button_box = dialog.findChild(QDialogButtonBox)
+    if button_box:
+        accept_button = button_box.button(QDialogButtonBox.Save if save else QDialogButtonBox.Open)
+        cancel_button = button_box.button(QDialogButtonBox.Cancel)
+        if accept_button:
+            accept_button.setText(accept_text)
+        if cancel_button:
+            cancel_button.setText(tr("Abbrechen"))
+        # Fallback für Plattformstile, die einen Standardbutton mit anderem
+        # Standard-Enum erzeugen, aber trotzdem in der Buttonbox führen.
+        for button in button_box.buttons():
+            if button.text().replace("&", "").strip().lower() in {"save", "open"}:
+                button.setText(accept_text)
+            elif button.text().replace("&", "").strip().lower() == "cancel":
+                button.setText(tr("Abbrechen"))
+    # Zusätzlicher Fallback für Qt-Themes, die Buttons direkt am Dialog führen.
+    for button in dialog.findChildren(QPushButton):
+        label = button.text().replace("&", "").strip().lower()
+        if label in {"save", "open"}:
+            button.setText(accept_text)
+        elif label == "cancel":
+            button.setText(tr("Abbrechen"))
+    if dialog.exec() != QDialog.Accepted:
+        return None
+    selected = dialog.selectedFiles()
+    return selected[0] if selected else None
+
+
+class LocalizedTextDialog(QDialog):
+    """Einzeilige Eingabe mit vollständig lokalisierten Schaltflächen."""
+    def __init__(self, parent, title: str, label: str, password: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(label))
+        self.edit = QLineEdit()
+        if password:
+            self.edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText(tr("OK"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("Abbrechen"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def get_text(parent, title: str, label: str, password: bool = False):
+        dialog = LocalizedTextDialog(parent, title, label, password)
+        if dialog.exec() == QDialog.Accepted:
+            return dialog.edit.text(), True
+        return "", False
+
+
+class LocalizedChoiceDialog(QDialog):
+    """Auswahldialog ohne nicht übersetzte Qt-Standardbuttons."""
+    def __init__(self, parent, title: str, label: str, choices: list[str], current: int = 0):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(label))
+        self.combo = QComboBox()
+        self.combo.addItems(choices)
+        self.combo.setCurrentIndex(max(0, min(current, len(choices) - 1)))
+        layout.addWidget(self.combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText(tr("OK"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("Abbrechen"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def get_item(parent, title: str, label: str, choices: list[str], current: int = 0):
+        dialog = LocalizedChoiceDialog(parent, title, label, choices, current)
+        if dialog.exec() == QDialog.Accepted:
+            return dialog.combo.currentText(), True
+        return "", False
+
+
+class PinDialog(QDialog):
+    def __init__(self, parent=None, confirm=False):
+        super().__init__(parent)
+        self.setWindowTitle(tr("Neue PIN") if confirm else "LunaNotiz – PIN")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.pin = QLineEdit()
+        self.pin.setEchoMode(QLineEdit.Password)
+        self.pin.setMaxLength(8)
+        form.addRow(tr("PIN (4–8 Ziffern)"), self.pin)
+        self.confirm = None
+        if confirm:
+            self.confirm = QLineEdit()
+            self.confirm.setEchoMode(QLineEdit.Password)
+            self.confirm.setMaxLength(8)
+            form.addRow(tr("PIN wiederholen"), self.confirm)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText(tr("OK"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("Abbrechen"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return self.pin.text(), self.confirm.text() if self.confirm else None
+
+
+def pin_digest(pin: str, salt: bytes) -> bytes:
+    return derive_key(pin, salt)
+
+
+def check_or_setup_pin(settings: QSettings) -> bool:
+    salt_hex = settings.value("security/pin_salt", "")
+    digest_hex = settings.value("security/pin_hash", "")
+    if not salt_hex or not digest_hex:
+        if settings.value("security/pin_setup_done", False, type=bool):
+            return True
+        answer = ask_yes_no(None, "LunaNotiz", tr("Möchtest du LunaNotiz mit einer PIN schützen?"), default_yes=True)
+        if not answer:
+            settings.setValue("security/pin_setup_done", True)
+            settings.sync()
+            return True
+        dialog = PinDialog(confirm=True)
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        pin, repeat = dialog.values()
+        if not pin.isdigit() or not 4 <= len(pin) <= 8:
+            QMessageBox.warning(None, "LunaNotiz", tr("Die PIN muss aus 4 bis 8 Ziffern bestehen."))
+            return False
+        if pin != repeat:
+            QMessageBox.warning(None, "LunaNotiz", tr("Die PINs stimmen nicht überein."))
+            return False
+        salt = os.urandom(16)
+        settings.setValue("security/pin_salt", salt.hex())
+        settings.setValue("security/pin_hash", pin_digest(pin, salt).hex())
+        settings.setValue("security/pin_setup_done", True)
+        settings.sync()
+        QMessageBox.information(None, "LunaNotiz", tr("PIN gespeichert.") + "\n" + tr("Bei Verlust der PIN ist kein Zugriff mehr möglich."))
+        return True
+    dialog = PinDialog()
+    if dialog.exec() != QDialog.Accepted:
+        return False
+    pin, _ = dialog.values()
+    try:
+        valid = pin_digest(pin, bytes.fromhex(salt_hex)).hex() == digest_hex
+    except Exception:
+        valid = False
+    if not valid:
+        QMessageBox.critical(None, "LunaNotiz", tr("Falsche PIN."))
+    return valid
+
+
 class NoteDialog(QDialog):
     def __init__(self, parent: QWidget, title: str = "", body: str = ""):
         super().__init__(parent)
@@ -172,6 +391,13 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(root)
         outer.setContentsMargins(18, 16, 18, 12)
         outer.setSpacing(12)
+
+        file_menu = self.menuBar().addMenu(tr("Datei"))
+        file_menu.addAction(tr("Exportieren …"), self.export_notes)
+        file_menu.addAction(tr("Importieren …"), self.import_notes)
+        security_menu = self.menuBar().addMenu(tr("Sicherheit"))
+        security_menu.addAction(tr("PIN-Schutz aktivieren / PIN ändern …"), self.change_pin)
+        security_menu.addAction(tr("PIN-Schutz deaktivieren"), self.disable_pin)
 
         header = QHBoxLayout()
         brand_col = QVBoxLayout()
@@ -526,11 +752,7 @@ class MainWindow(QMainWindow):
             return
         if self._is_dirty() and not self._confirm_pending_changes(switching=True):
             return
-        answer = QMessageBox.question(
-            self, tr("Notiz löschen"), tr("Diese Notiz wirklich löschen?"),
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if answer == QMessageBox.Yes:
+        if ask_yes_no(self, tr("Notiz löschen"), tr("Diese Notiz wirklich löschen?"), default_yes=False):
             self.store.delete(self.current_id)
             self.current_id = None
             self._saved_title = self._saved_body = ""
@@ -539,6 +761,125 @@ class MainWindow(QMainWindow):
             self.modified_label.setText(tr("Noch nicht gespeichert"))
             self.refresh(select_id=None)
             self.statusBar().showMessage(tr("Notiz wurde gelöscht."), 2500)
+
+    def change_pin(self) -> None:
+        # Dieser Menüpunkt funktioniert sowohl bei deaktiviertem als auch bei aktivem PIN-Schutz.
+        dialog = PinDialog(self, confirm=True)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        pin, repeat = dialog.values()
+        if not pin.isdigit() or not 4 <= len(pin) <= 8:
+            QMessageBox.warning(self, APP_NAME, tr("Die PIN muss aus 4 bis 8 Ziffern bestehen."))
+            return
+        if pin != repeat:
+            QMessageBox.warning(self, APP_NAME, tr("Die PINs stimmen nicht überein."))
+            return
+        salt = os.urandom(16)
+        self.settings.setValue("security/pin_salt", salt.hex())
+        self.settings.setValue("security/pin_hash", pin_digest(pin, salt).hex())
+        self.settings.setValue("security/pin_setup_done", True)
+        self.settings.sync()
+        QMessageBox.information(self, APP_NAME, tr("PIN gespeichert."))
+
+    def disable_pin(self) -> None:
+        if not self.settings.value("security/pin_hash", ""):
+            return
+        if ask_yes_no(self, APP_NAME, tr("PIN-Schutz wirklich deaktivieren?"), default_yes=False):
+            self.settings.remove("security/pin_salt")
+            self.settings.remove("security/pin_hash")
+            self.settings.remove("security/pin_salt")
+            self.settings.setValue("security/pin_setup_done", True)
+            self.settings.sync()
+            self.statusBar().showMessage(tr("PIN-Schutz deaktiviert. Du kannst ihn jederzeit über Sicherheit wieder aktivieren."), 6000)
+
+    def _backup_payload(self) -> bytes:
+        notes = [dict(row) for row in self.store.all()]
+        payload = {"format": "LunaNotiz", "version": 1,
+                   "exported_at": datetime.now().isoformat(timespec="seconds"), "notes": notes}
+        return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+    def export_notes(self) -> None:
+        choice, ok = LocalizedChoiceDialog.get_item(self, APP_NAME, tr("Exportformat auswählen:"),
+            [tr("Normales JSON"), tr("Verschlüsselte Sicherung (AES-256-GCM)")], 1)
+        if not ok:
+            return
+        encrypted = choice.startswith(tr("Verschlüsselte"))
+        ext = ".lnbackup" if encrypted else ".json"
+        path = localized_file_dialog(self, tr("Notizen exportieren"), True,
+                                     "LunaNotiz Backup (*.lnbackup);;JSON (*.json)",
+                                     "LunaNotiz-Backup" + ext)
+        if not path:
+            return
+        data = self._backup_payload()
+        if encrypted:
+            password, ok = LocalizedTextDialog.get_text(self, APP_NAME, tr("Bitte Backup-Passwort eingeben:"), password=True)
+            if not ok or not password:
+                return
+            repeat, ok = LocalizedTextDialog.get_text(self, APP_NAME, tr("Passwort wiederholen"), password=True)
+            if not ok:
+                return
+            if password != repeat:
+                QMessageBox.warning(self, APP_NAME, tr("Die Passwörter stimmen nicht überein."))
+                return
+            salt, nonce = os.urandom(16), os.urandom(12)
+            encrypted_data = AESGCM(derive_key(password, salt)).encrypt(nonce, data, b"LunaNotiz-backup-v1")
+            data = json.dumps({"format": "LunaNotiz-encrypted", "version": 1,
+                "kdf": "scrypt", "salt": base64.b64encode(salt).decode("ascii"),
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ciphertext": base64.b64encode(encrypted_data).decode("ascii")}, indent=2).encode("utf-8")
+        try:
+            Path(path).write_bytes(data)
+            QMessageBox.information(self, APP_NAME, tr("Export abgeschlossen."))
+        except OSError as exc:
+            QMessageBox.critical(self, APP_NAME, str(exc))
+
+    def import_notes(self) -> None:
+        path = localized_file_dialog(self, tr("Notizen importieren"), False,
+                                     "LunaNotiz Backup (*.lnbackup *.json);;Alle Dateien (*)")
+        if not path:
+            return
+        try:
+            envelope = json.loads(Path(path).read_text(encoding="utf-8"))
+            if envelope.get("format") == "LunaNotiz-encrypted":
+                password, ok = LocalizedTextDialog.get_text(self, APP_NAME, tr("Bitte Backup-Passwort eingeben:"), password=True)
+                if not ok or not password:
+                    return
+                salt = base64.b64decode(envelope["salt"], validate=True)
+                nonce = base64.b64decode(envelope["nonce"], validate=True)
+                ciphertext = base64.b64decode(envelope["ciphertext"], validate=True)
+                clear = AESGCM(derive_key(password, salt)).decrypt(nonce, ciphertext, b"LunaNotiz-backup-v1")
+                envelope = json.loads(clear.decode("utf-8"))
+            if envelope.get("format") != "LunaNotiz" or not isinstance(envelope.get("notes"), list):
+                raise ValueError("invalid backup")
+            notes = envelope["notes"]
+            if any(not isinstance(n, dict) or not isinstance(n.get("title"), str)
+                   or not isinstance(n.get("body", ""), str) for n in notes):
+                raise ValueError("invalid note")
+        except Exception:
+            QMessageBox.critical(self, APP_NAME, tr("Sicherung ungültig, beschädigt oder Passwort falsch."))
+            return
+        mode, ok = LocalizedChoiceDialog.get_item(self, APP_NAME, tr("Importmodus auswählen:"),
+            [tr("Zusammenführen"), tr("Alle vorhandenen Notizen ersetzen")], 0)
+        if not ok:
+            return
+        if mode == tr("Alle vorhandenen Notizen ersetzen") and not ask_yes_no(
+                self, APP_NAME, tr("Wirklich alle vorhandenen Notizen ersetzen?"), default_yes=False):
+            return
+        try:
+            with self.store.db:
+                if mode == tr("Alle vorhandenen Notizen ersetzen"):
+                    self.store.db.execute("DELETE FROM notes")
+                for note in notes:
+                    self.store.db.execute("INSERT INTO notes(title,body) VALUES(?,?)",
+                                          (note["title"], note.get("body", "")))
+            self.current_id = None
+            self._saved_title = self._saved_body = ""
+            self.note_title.clear()
+            self.note_body.clear()
+            self.refresh(select_id=None)
+            QMessageBox.information(self, APP_NAME, tr("Import abgeschlossen."))
+        except sqlite3.Error as exc:
+            QMessageBox.critical(self, APP_NAME, str(exc))
 
     def closeEvent(self, event) -> None:
         if self._confirm_pending_changes(switching=False):
@@ -555,6 +896,8 @@ def main() -> int:
     app.setOrganizationName("Luna")
     settings = QSettings("Luna", "LunaNotiz")
     UI_LANGUAGE = settings.value("language", "de")
+    if not check_or_setup_pin(settings):
+        return 0
     window = MainWindow()
     window.show()
     return app.exec()
