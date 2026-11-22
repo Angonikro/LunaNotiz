@@ -1,0 +1,11 @@
+Package: lunanotiz
+Version: 0.1.9
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Luna-Familie
+Depends: python3 (>= 3.13), python3-pyside6.qtwidgets, python3-pyside6.qtgui
+Description: Lokale Offline-Notizenverwaltung der Luna-Familie
+ LunaNotiz ist eine deutsch- und englischsprachige Desktop-Anwendung zum Erstellen,
+ Bearbeiten, Durchsuchen und Löschen persönlicher Notizen. Die Daten
+ werden lokal in einer SQLite-Datenbank gespeichert.

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LunaNotiz
+Comment=Lokale Notizen einfach verwalten
+Comment[de]=Lokale Notizen einfach verwalten
+Comment[en]=Manage local notes easily
+Exec=lunanotiz
+Icon=lunanotiz
+Terminal=false
+Categories=Utility;Office;
+StartupNotify=true
